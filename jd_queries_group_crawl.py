@@ -288,6 +288,14 @@ def main(argv: list[str] | None = None) -> int:
         "从该条起跑完本组，再依次跑 JSON 后续所有分组直到末尾；首组若跳过若干条且该组 CSV 已存在非空则追加。",
     )
     parser.add_argument(
+        "--supplement-keywords",
+        nargs="+",
+        metavar="KW",
+        default=None,
+        help="仅爬取所列完整搜索词（可多个），结果追加到 --only-group-id 对应 CSV；"
+        "须同时指定 --only-group-id；不可与 --start-from-keyword-substr / --skip-until-keyword-substr 同用。",
+    )
+    parser.add_argument(
         "--chrome-path",
         default="",
         metavar="EXE",
@@ -315,6 +323,22 @@ def main(argv: list[str] | None = None) -> int:
 
     start_sub = (args.start_from_keyword_substr or "").strip()
     skip_sub = (args.skip_until_keyword_substr or "").strip()
+    sup_kws_raw = getattr(args, "supplement_keywords", None)
+
+    if sup_kws_raw is not None:
+        if not only_gid:
+            print(
+                "--supplement-keywords 必须与 --only-group-id 同时使用。",
+                file=sys.stderr,
+            )
+            return 2
+        if start_sub or skip_sub:
+            print(
+                "补充模式不可与 --start-from-keyword-substr 或 --skip-until-keyword-substr 同用。",
+                file=sys.stderr,
+            )
+            return 2
+
     if start_sub and skip_sub:
         print(
             "不能同时使用 --start-from-keyword-substr 与 --skip-until-keyword-substr，"
@@ -346,6 +370,65 @@ def main(argv: list[str] | None = None) -> int:
     summary: list[tuple[str, int, int]] = []
 
     try:
+        if sup_kws_raw is not None:
+            kws = [
+                k.strip()
+                for k in sup_kws_raw
+                if isinstance(k, str) and k.strip()
+            ]
+            if not kws:
+                print("--supplement-keywords 至少需要一条非空关键词。", file=sys.stderr)
+                return 2
+            group = groups[0]
+            gid = str(group.get("id", "")).strip()
+            label = str(group.get("label", gid))
+            filename = _group_csv_name(group)
+            path = args.out_dir / filename
+            append_existing = path.is_file() and path.stat().st_size > 0
+            if append_existing:
+                print("[补充] 在已有 CSV 末尾追加（不写表头）")
+            else:
+                print("[补充] 将新建 CSV 并写入表头")
+
+            print("\n" + "=" * 60)
+            print(f"[补充] {label} ({gid}) -> {path} ，共 {len(kws)} 条关键词")
+            print("=" * 60)
+
+            group_packets = 0
+            group_rows = 0
+            file_mode = "a" if append_existing else "w"
+            with open(path, file_mode, encoding="utf-8-sig", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDNAMES)
+                if not append_existing:
+                    writer.writeheader()
+                for seq, kw in enumerate(kws):
+                    print(f"  [{seq + 1}/{len(kws)}] 搜索: {kw}")
+                    pkt, n, rows = run_one_keyword(
+                        page,
+                        keyword=kw,
+                        listen_mask=args.listen_mask,
+                        max_rows=args.max_rows_per_keyword,
+                        extra_packet_waits=args.extra_packet_waits,
+                        packet_wait_timeout=args.packet_wait_timeout,
+                        after_click_sleep=args.after_click_sleep,
+                    )
+                    group_packets += pkt
+                    group_rows += n
+                    for row in rows:
+                        writer.writerow(row)
+                    f.flush()
+                    print(f"       收包 {pkt}，写入 {n} 条")
+                    if seq < len(kws) - 1:
+                        time.sleep(args.pause_between_keywords)
+
+            summary.append((filename, group_packets, group_rows))
+            print(f"已保存 {path} ，累计收包 {group_packets} ，写入 {group_rows} 行")
+
+            print("\n全部结束汇总：")
+            for fn, pkt, r in summary:
+                print(f"  {fn}: {r} 行, {pkt} 包")
+            return 0
+
         if chain_plan is not None:
             _run_chain = chain_plan
             for j, (group, keywords, skipped_prefix_rows) in enumerate(_run_chain):
